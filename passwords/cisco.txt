@@ -1,0 +1,7 @@
+none:none
+cisco:cisco
+admin:admin
+admin:none
+#Cisco ISE
+admin:Test123
+admin:Cisco123

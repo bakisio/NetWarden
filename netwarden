@@ -1,0 +1,829 @@
+#!/bin/bash
+################################################################################
+#              _   _      ___          __           _                          #
+#             | \ | |    | \ \        / /          | |                         #
+#             |  \| | ___| |\ \  /\  / /_ _ _ __ __| | ___ _ __                #
+#             | . ` |/ _ \ __\ \/  \/ / _` | '__/ _` |/ _ \ '_ \               #
+#             | |\  |  __/ |_ \  /\  / (_| | | | (_| |  __/ | | |              #
+#             |_| \_|\___|\__| \/  \/ \__,_|_|  \__,_|\___|_| |_|              #
+#                                                                              #
+################################################################################
+#                                                                              #
+# Por: Doug Ingham                                                             #
+# Ver: 1.7.2 (07/06/23)                                                        #
+#                                                                              #
+################################################################################
+#                                 NetWarden                                    #
+# I'm watching you!                                                            #
+#                                                                              #
+# TODO:                                                                        #
+# - Implement proper DB (MySQL/MariaDB)                                        #
+# - [Zbx] Implement two groups, managed & unmanaged                            #
+# - [Zbx] Add templates to hosts with existing templates                       #
+#                                                                              #
+################################################################################
+
+#######################################
+#               Manual                #
+#######################################
+
+print_help(){ echo '
+NetWarden (v1.7.2 07/06/23)
+Usage: netwarden <action> <type> <target>
+
+DISCOVER:
+    discover devices <file|ip[/network]>         - Scan for new devices using ping
+
+SCAN:
+    scan ports <ip[/network]> <ports>            - Scan target for specific open port(s) using formats: 22 21,22,23 21-23
+    scan ports <ip[/network]> <all|common>       - Scan target for all, or only common, open ports
+    scan users <default> <ip[/network]> [service] [port] [file]
+                                                 - Test target for default credentials
+    scan vulns <ip[/network]>                    - Scan target for known vulnerabilities
+    scan new devices [hours]                     - Run default vulnerability scans for all devices discovered x hours ago
+    scan new [vuln] [hours]                      - Run default vulnerability scans for all devices discovered x hours ago
+
+GET:
+    get host services <ip>                       - List services identified on host
+
+CLEAN:
+    clean [hosts|services|all] [days]            - Remove objects not seen in the last X days
+
+SYNC:
+	sync [ip]                                    - Syncronise connected services
+
+MISC:
+    help                                         - Print help
+
+'; exit
+}
+
+
+#######################################
+#             Environment             #
+#######################################
+
+# Enable output if shell is interactive
+[[ -z $PS1 ]] && silent=1 || silent=0
+
+# Save PWD to execDir and change to script dir
+execDir="$PWD"
+cd $(dirname $0)
+
+# Load configurations
+source netwarden.conf
+
+# Check dependencies
+dependencies=(sqlite3 nmap ncrack jq zabbix_sender)
+for pkg in ${dependencies[@]}; do
+	if ! which $pkg >/dev/null; then
+		echo "Missing dependency: $pkg"
+		exit 1
+	fi
+done
+
+if [[ ! -d "$cachedir" ]]; then
+	mkdir -p $cachedir
+	if [[ $? != 0 ]]; then
+		echo "Erro: Não foi possível criar $cachedir"
+		exit 1
+	fi
+elif [[ ! -w "$cachedir" ]]; then
+		echo "Erro: Sem permissões de escrita no $cachedir"
+		exit 1
+fi
+
+if [[ ! -d "$(dirname $logfile)" ]]; then mkdir -p "$(dirname $logfile)" || exit 1; fi
+if [[ ! -e "$logfile" ]]; then touch "$logfile" || exit 1; fi
+
+lockDir="${cachedir}/queue"; lockFile="${lockDir}/$$"
+if [[ ! -d "$lockDir" ]]; then mkdir -p "$lockDir" || exit 1; fi
+if [[ ! -w "$lockDir" ]]; then exit 1; fi
+
+if [[ "$dbengine" = "sqlite3" ]]; then
+	dbfile="${cachedir}/${db}.db"
+	sql="sqlite3 -column $dbfile"	# Single-select
+	sqlm="sqlite3 $dbfile"			# Multi-select (| seperator)
+	if [[ -e "$dbfile" ]] && [[ ! -w "$dbfile" ]]; then
+		echo "Erro: Sem permissões de escrita no $dbfile"
+		exit 1
+	elif [[ ! -f "$dbfile" ]]; then
+		$sql 'CREATE TABLE hosts (
+			ip TEXT NOT NULL,
+			mac TEXT,
+			hostname TEXT,
+			vendor TEXT,
+			os TEXT,
+			first_seen INT,
+			last_seen INT,
+			PRIMARY KEY (ip)
+		);'
+		$sql 'CREATE TABLE vulns (
+			ip TEXT NOT NULL,
+			service TEXT,
+			port INT,
+			defcred INT,
+			defcred_t INT,
+			weakcred INT,
+			weakcred_t INT,
+			highvulns INT,
+			highvulns_t INT,
+			critvulns INT,
+			critvulns_t INT
+		);'
+		# vulns: defcred, weakcred, highvulns, critvulns
+		$sql 'CREATE TABLE services (
+			ip TEXT NOT NULL,
+			service TEXT,
+			port INT,
+			product TEXT,
+			version TEXT,
+			first_seen INT,
+			last_seen INT
+		);'
+	fi
+fi
+xq="/usr/bin/xq-python -rMc"
+
+tmpdir=$(mktemp -p "${cachedir}" -d)
+# Fazer uma limpeza antes de encerrar o script
+cleanup() {
+	rm -rf "$tmpdir" "$lockFile"
+}
+trap cleanup EXIT HUP INT QUIT ABRT TERM
+
+
+#######################################
+#              Functions              #
+#######################################
+
+isValidIP() {
+	if [[ ! "$1" =~ ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$ ]]; then
+		return 1
+	fi
+}
+
+isValidSubnet() {
+	if [[ ! "$1" =~ ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])/(0|[12][0-9]|3[0-2])$ ]]; then
+		return 1
+	fi
+}
+
+api_request(){
+	checkQueue
+	./api/zabbix.sh "$@" &
+}
+
+discover_devices(){
+	xmlObject=0;
+	while IFS= read -r line; do
+		# Identificar o início do objeto XML
+		if [[ "$line" =~ "<host>" ]]; then xmlObject=1; fi
+		while [[ $xmlObject = 1 ]]; do
+			# Skip unwanted lines
+			if [[ "$line" =~ \<(address|hostname)\  ]]; then
+
+				if [[ "$line" =~ 'addrtype="ipv4"' ]]; then
+					ip=$(echo $line | sed -r 's/.*addr="([^"]*)".*/\1/g')
+					break
+				elif [[ "$line" =~ 'addrtype="mac"' ]]; then
+					mac=$(echo $line | sed -r 's/.*addr="([^"]*)".*/\1/g')
+					if [[ "$line" =~ 'vendor=' ]]; then
+						vendor=$(echo $line | sed -r 's/.*vendor="([^"]*)".*/\1/g')
+					fi
+					break
+				elif [[ "$line" =~ 'type="PTR"' ]]; then
+					hostname=$(echo $line | sed -r 's/.*name="([^"]*)".*/\1/g' | sed "s/${localdomain}//")
+					break
+				fi
+
+			# Identificar o final do objeto XML
+			elif [[ "$line" =~ "</host>" ]]; then
+				timestamp="$(date +%s)"
+
+				# Se o IP já for registrado, apenas atualiza o registro
+				if [[ -n $($sql "SELECT ip FROM hosts WHERE ip='$ip';") ]]; then
+					if [[ -n $mac ]]; then
+						false; until [[ $? = 0 ]]; do
+							$sql "UPDATE hosts SET mac='$mac',hostname='$hostname',vendor='$vendor',last_seen='$timestamp' WHERE ip='$ip';" 2>/dev/null
+						done
+						api_request update host ip="$ip" hostname="$hostname" mac="$mac" vendor="$vendor" lastseen="$timestamp"
+						#log "INFO: Updating host ip="$ip" hostname="$hostname" mac="$mac" vendor="$vendor""
+					else
+						false; until [[ $? = 0 ]]; do
+							$sql "UPDATE hosts SET hostname='$hostname',last_seen='$timestamp' WHERE ip='$ip';" 2>/dev/null
+						done
+						api_request update host ip="$ip" hostname="$hostname" lastseen="$timestamp"
+						#log "INFO: Updating host ip="$ip" hostname="$hostname""
+					fi
+				else
+					# Insira um novo registro
+					false; until [[ $? = 0 ]]; do
+						$sql "INSERT OR REPLACE INTO hosts (ip,mac,hostname,vendor,first_seen,last_seen) VALUES ('$ip','$mac','$hostname','$vendor','$timestamp','$timestamp');" 2>/dev/null
+					done
+
+					api_request update host ip="$ip" hostname="$hostname" mac="$mac" vendor="$vendor" lastseen="$timestamp"
+					log "INFO: Adding host ip="$ip" hostname="$hostname" mac="$mac" vendor="$vendor""
+					$0 scan ports $ip &
+				fi
+
+				unset ip mac vendor hostname timestamp
+				xmlObject=0;
+			fi
+			break
+		done
+	done < $1
+}
+
+scan_users_default(){
+	checkQueue
+	vuln="defcred"
+	ip="$1"
+	service="$2"
+	port="$3"
+	if [[ -z $ip ]] || [[ -z $service ]] || [[ -z $port ]]; then
+		echo "Missing paramters!"
+		print_help
+	fi
+
+	# Supported services
+	if [[ ! "$service" =~ (ssh|telnet) ]]; then
+		return 0
+	fi
+
+	if [[ -n $4 ]]; then
+		passwordFile="$execDir/$4"
+	else
+		vendor="$($sql "SELECT vendor FROM hosts WHERE ip='$ip';")"
+		get_vendor_passwords
+	fi
+
+	timestamp="$(date +%s)"
+
+	if [[ -z $passwordFile ]] || [[ ! -e $passwordFile ]]; then
+		status=2
+		log "INFO: Default credential database not available for this service"
+	else
+		usrList="$(mktemp -p ${tmpdir})"
+		pwList="$(mktemp -p ${tmpdir})"
+		grep -v '^#' ${passwordFile} | cut -f1 -d ':' > $usrList
+		grep -v '^#' ${passwordFile} | cut -f2 -d ':' > $pwList
+
+		log "INFO: Testing default $service credentials on $ip:$port"
+		#https://nmap.org/ncrack/
+		if [[ $(ncrack -f -U $usrList -P $pwList --pairwise -oX - ${service}://${ip}:${port} 2>/dev/null || exit 1) =~ "</credentials>" ]]; then
+			status=1
+			log "INFO: Default $service credentials found on $ip:$port"
+		else
+			status=0
+			log "INFO: Default $service credentials not found on $ip:$port"
+		fi
+
+		if [[ -n $($sql "SELECT ip FROM vulns WHERE ip='${ip}' AND service='${service}' AND port='${port}';") ]]; then
+			$sql "UPDATE vulns
+			SET $vuln='${status}',${vuln}_t=${timestamp}
+			WHERE ip='$ip' AND service='${service}' AND port='${port}';"
+		else
+			false; until [[ $? = 0 ]]; do
+				$sql "INSERT INTO vulns (ip,service,port,${vuln},${vuln}_t)
+				VALUES ('$ip','${service}',${port},'${status}',${timestamp});" 2>/dev/null
+			done
+		fi
+	fi
+
+	api_request update item ip="$ip" service="$service" port="$port" item="$vuln" value="$status" lastseen="$timestamp"
+}
+
+get_vendor_passwords(){
+	# List all vars beginning with vendor_
+	for vendorStrings in $(echo "${!vendor_*}"); do
+		
+		# Expand value of var set in vendorStrings and compare against $vendor
+		if $(echo "$vendor" | grep -qE "(${!vendorStrings})"); then
+			vendorSig="$(echo $vendorStrings | sed 's/vendor_/vendorSig_/')"
+			passwordFile="${passwordDir}/${!vendorSig}.txt"
+			break
+		fi
+
+	done
+}
+
+scan_ports(){
+	checkQueue
+	target="$1"
+	ports="${2:-all}"
+
+	# Validate non-empty vars
+	if [[ -z $target ]]; then
+		echo "Define target scope: scan ports <ip> <ports|all|common>"
+		exit
+	fi
+
+	# Validate port range format (1 1-3 1,2,3)
+	if [[ ! "$ports" =~ ^(all|common)$ ]]; then
+		if [[ -n $(echo "$ports" | sed -r 's/[1-9]([0-9,-]+)?//g') ]] ||
+		(( 1 < $(echo "$ports" | grep -o '-' | wc -l) )) ||
+		[[ -z $(echo "$ports" | sed -r 's/.*(^[,-]|[,-]$|[,-]{2}).*//g') ]]; then
+			echo "Invalid port range"
+			exit 1
+		fi
+	fi
+
+	# Set nmap arguments
+	if [[ "$ports" = "all" ]]; then
+		local args=""
+	elif [[ "$ports" = "common" ]]; then
+		local args="-F"
+	else
+		local args="-p $ports"
+	fi
+
+#	# Validate IP/network
+#	if isValidSubnet "$target" || isValidIP "$target"; then
+#		tmpfile=$(mktemp -p "${tmpdir}")
+#		# Run scan
+#		sudo nmap $args -A --osscan-limit -oX "$tmpfile" "$target" >/dev/null || exit
+#		target="$tmpfile"
+#	# Validate file
+#	elif [[ ! -f "$target" ]]; then
+#		echo "Invalid file: $target"
+#		exit
+#	fi
+
+	if [[ ! -f "$target" ]]; then
+		tmpfile=$(mktemp -p "${tmpdir}")
+		log "INFO: Scanning ports ($ports) and services for $target"
+		# Run scan
+		sudo nmap $args -T4 -A --osscan-limit -oX "$tmpfile" "$target" >/dev/null || exit 1
+		target="$tmpfile"
+	fi
+
+	# Process scan results
+	local h
+	local hcount=$($xq '.nmaprun.runstats.hosts["@up"]' $target)
+
+	# If single host
+	if (( $hcount == 1 )); then
+		timestamp="$($xq ".nmaprun.host[\"@starttime\"]" $target)"
+		mac="$($xq ".nmaprun.host.address[] | select(.[\"@addrtype\"]==\"mac\") | .[\"@addr\"]" $target 2>/dev/null)"
+		if [[ -n $mac ]]; then
+			ip="$($xq ".nmaprun.host.address[] | select(.[\"@addrtype\"]==\"ipv4\") | .[\"@addr\"]" $target)"
+			vendor="$($xq ".nmaprun.host.address[] | select(.[\"@addrtype\"]==\"mac\") | .[\"@vendor\"]" $target 2>/dev/null)"
+		else
+			ip="$($xq ".nmaprun.host.address[\"@addr\"]" $target)"
+			unset vendor
+		fi
+		hostname="$($xq ".nmaprun.host.hostnames.hostname[\"@name\"]" $target 2>/dev/null)"
+		if [[ "$hostname" == "null" ]]; then unset hostname; fi
+		os="$($xq ".nmaprun.host.os.osmatch[0][\"@name\"]" $target 2>/dev/null)"
+		if [[ "$os" == "null" ]]; then unset os; fi
+
+		update_host
+
+		# If single port (& single host)
+		if $xq ".nmaprun.host.ports.port[\"@portid\"]" $target >/dev/null 2>&1; then
+			if [[ "open" == "$($xq ".nmaprun.host.ports.port.state[\"@state\"]" $target)" ]]; then
+				port="$($xq ".nmaprun.host.ports.port[\"@portid\"]" $target)"
+				service="$($xq ".nmaprun.host.ports.port.service[\"@name\"]" $target)"
+				product="$($xq ".nmaprun.host.ports.port.service[\"@product\"]" $target 2>/dev/null)"
+				if [[ "$product" == "null" ]]; then unset product; fi
+				version="$($xq ".nmaprun.host.ports.port.service[\"@version\"]" $target 2>/dev/null)"
+				if [[ "$version" == "null" ]]; then unset version; fi
+
+				update_service
+			fi
+		# If multiple ports (& single host)
+		elif $xq ".nmaprun.host.ports.port[][\"@portid\"]" $target >/dev/null 2>&1; then
+			local p
+			local pcount=$($xq ".nmaprun.host.ports.port[][\"@portid\"]" $target | wc -l)
+			for ((p=0;p<$pcount;p++)); do
+				if [[ "open" == "$($xq ".nmaprun.host.ports.port[$p].state[\"@state\"]" $target)" ]]; then
+					port="$($xq ".nmaprun.host.ports.port[$p][\"@portid\"]" $target)"
+					service="$($xq ".nmaprun.host.ports.port[$p].service[\"@name\"]" $target)"
+					product="$($xq ".nmaprun.host.ports.port[$p].service[\"@product\"]" $target 2>/dev/null)"
+					if [[ "$product" == "null" ]]; then unset product; fi
+					version="$($xq ".nmaprun.host.ports.port[$p].service[\"@version\"]" $target 2>/dev/null)"
+					if [[ "$version" == "null" ]]; then unset version; fi
+
+					update_service
+				fi
+			done
+		fi
+
+	# If multiple hosts
+	elif (( $hcount > 1 )); then
+		for ((h=0;h<$hcount;h++)); do
+			timestamp="$($xq ".nmaprun.host[$h][\"@starttime\"]" $target)"
+			mac="$($xq ".nmaprun.host[$h].address[] | select(.[\"@addrtype\"]==\"mac\") | .[\"@addr\"]" $target 2>/dev/null)"
+			if [[ -n $mac ]]; then
+				ip="$($xq ".nmaprun.host[$h].address[] | select(.[\"@addrtype\"]==\"ipv4\") | .[\"@addr\"]" $target)"
+				vendor="$($xq ".nmaprun.host[$h].address[] | select(.[\"@addrtype\"]==\"mac\") | .[\"@vendor\"]" $target 2>/dev/null)"
+			else
+				ip="$($xq ".nmaprun.host[$h].address[\"@addr\"]" $target)"
+				unset vendor
+			fi
+			hostname="$($xq ".nmaprun.host[$h].hostnames.hostname[\"@name\"]" $target 2>/dev/null)"
+			if [[ "$hostname" == "null" ]]; then unset hostname; fi
+			os="$($xq ".nmaprun.host[$h].os.osmatch[0][\"@name\"]" $target 2>/dev/null)"
+			if [[ "$os" == "null" ]]; then unset os; fi
+
+			update_host
+
+			# If single port (& multiple hosts)
+			if $xq ".nmaprun.host[$h].ports.port[\"@portid\"]" $target >/dev/null 2>&1; then
+				if [[ "open" == "$($xq ".nmaprun.host[$h].ports.port.state[\"@state\"]" $target)" ]]; then
+					port="$($xq ".nmaprun.host[$h].ports.port[\"@portid\"]" $target)"
+					service="$($xq ".nmaprun.host[$h].ports.port.service[\"@name\"]" $target)"
+					product="$($xq ".nmaprun.host[$h].ports.port.service[\"@product\"]" $target 2>/dev/null)"
+					if [[ "$product" == "null" ]]; then unset product; fi
+					version="$($xq ".nmaprun.host[$h].ports.port.service[\"@version\"]" $target 2>/dev/null)"
+					if [[ "$version" == "null" ]]; then unset version; fi
+
+					update_service
+				fi
+			# If multiple ports (& multiple hosts)
+			elif $xq ".nmaprun.host[$h].ports.port[][\"@portid\"]" $target >/dev/null 2>&1; then
+				local p
+				local pcount=$($xq ".nmaprun.host[$h].ports.port[][\"@portid\"]" $target | wc -l)
+				for ((p=0;p<$pcount;p++)); do
+					if [[ "open" == "$($xq ".nmaprun.host[$h].ports.port[$p].state[\"@state\"]" $target)" ]]; then
+						port="$($xq ".nmaprun.host[$h].ports.port[$p][\"@portid\"]" $target)"
+						service="$($xq ".nmaprun.host[$h].ports.port[$p].service[\"@name\"]" $target)"
+						product="$($xq ".nmaprun.host[$h].ports.port[$p].service[\"@product\"]" $target 2>/dev/null)"
+						if [[ "$product" == "null" ]]; then unset product; fi
+						version="$($xq ".nmaprun.host[$h].ports.port[$p].service[\"@version\"]" $target 2>/dev/null)"
+						if [[ "$version" == "null" ]]; then unset version; fi
+
+						update_service
+					fi
+				done
+			fi
+
+		done
+	fi
+	unset ip mac vendor hostname os service port product version timestamp 
+}
+
+update_service(){
+	# service: ip, service, port, product, version, last_seen
+
+	local sqlstr
+	IFS='|' read -a sqlstr < <($sqlm "SELECT ip,service,product,version,last_seen FROM services WHERE ip='$ip' AND port='$port';")
+	local stored_ip="${sqlstr[0]}"
+	local stored_service="${sqlstr[1]}"
+	local stored_product="${sqlstr[2]}"
+	local stored_version="${sqlstr[3]}"
+	local stored_last_seen="${sqlstr[4]}"
+
+	# Se o serviço nunca foi registrado, adicionar um novo registro
+	if [[ -z $stored_last_seen ]]; then 
+		# Verify the host exists
+		update_host
+
+		# Insira um novo registro
+		false; until [[ $? = 0 ]]; do
+			$sql "INSERT INTO services (ip,service,port,product,version,first_seen,last_seen)
+			VALUES ('$ip','$service','$port','$product','$version','$timestamp','$timestamp');" 2>/dev/null
+		done
+
+		api_request update item ip="$ip" service="$service" port="$port" lastseen="$timestamp"
+		[[ -n $product ]] && api_request update item ip="$ip" service="$service" port="$port" item="product" value="$product"
+		[[ -n $version ]] && api_request update item ip="$ip" service="$service" port="$port" item="version" value="$version"
+
+		log "INFO: Adding new service $service for $ip:$port ($product $version)"
+
+	# Se o serviço já foi registrado, apenas atualizar o registro
+	elif (( ${stored_last_seen} < $timestamp )); then
+		# Se nada mudou, apenas atualizar o timestamp lastseen
+		if [[ "$stored_service" == "$service" ]] && [[ "$stored_product" == "$product" ]] && [[ "$stored_version" == "$version" ]]; then 
+			false; until [[ $? = 0 ]]; do
+				$sql "UPDATE services
+				SET last_seen='$timestamp'
+				WHERE ip='$ip' AND port='$port';" 2>/dev/null
+			done
+
+			api_request update item ip="$ip" service="$service" port="$port" lastseen="$timestamp"
+
+		# Se o serviço mudou, atualizar tudo
+		elif [[ "$stored_service" != "$service" ]]; then 
+			false; until [[ $? = 0 ]]; do
+				$sql "UPDATE services
+				SET service='$service',product='$product',version='$version',last_seen='$timestamp',first_seen='$timestamp'
+				WHERE ip='$ip' AND port='$port';" 2>/dev/null
+			done
+
+			# Not currently required
+			#api_request delete item ip="$ip" service="$service" port="$port"
+
+			# This will register the service as a new item
+			api_request update item ip="$ip" service="$service" port="$port" lastseen="$timestamp"
+			[[ -n $product ]] && api_request update item ip="$ip" service="$service" port="$port" item="product" value="$product"
+			[[ -n $version ]] && api_request update item ip="$ip" service="$service" port="$port" item="version" value="$version"
+
+			log "INFO: Updating service for $ip:$port (from $stored_service '$stored_product $stored_version' to $service '$product $version')"
+
+		# Se o produto mudou, atualizar tudo
+		elif [[ "$stored_product" != "$product" ]]; then 
+			false; until [[ $? = 0 ]]; do
+				$sql "UPDATE services
+				SET product='$product',version='$version',last_seen='$timestamp',first_seen='$timestamp'
+				WHERE ip='$ip' AND port='$port';" 2>/dev/null
+			done
+
+			api_request update item ip="$ip" service="$service" port="$port" item="product" value="$product" lastseen="$timestamp"
+			api_request update item ip="$ip" service="$service" port="$port" item="version" value="$version"
+
+			log "INFO: Updating product for $service at $ip:$port (from '$stored_product $stored_version' to '$product $version')"
+
+		elif [[ "$stored_version" != "$version" ]]; then 
+			false; until [[ $? = 0 ]]; do
+				$sql "UPDATE services
+				SET version='$version',last_seen='$timestamp'
+				WHERE ip='$ip' AND port='$port';" 2>/dev/null
+			done
+
+			api_request update item ip="$ip" service="$service" port="$port" item="version" value="$version" lastseen="$timestamp"
+
+			log "INFO: Updating version for $product at $ip:$port (from '$stored_version' to '$version')"
+		fi
+
+	fi
+
+	#unset ip mac vendor hostname os service port product version timestamp 
+}
+
+update_host(){
+	# host: ip, mac, hostname, vendor, os, last_seen
+
+	local sqlstr
+	IFS='|' read -a sqlstr < <($sqlm "SELECT ip,mac,hostname,vendor,os,last_seen FROM hosts WHERE ip='$ip';")
+	local stored_ip="${sqlstr[0]}"
+	local stored_mac="${sqlstr[1]}"
+	local stored_hostname="${sqlstr[2]}"
+	local stored_vendor="${sqlstr[3]}"
+	local stored_os="${sqlstr[4]}"
+	local stored_last_seen="${sqlstr[5]}"
+
+	# Se o host nunca foi visto, insira ele
+	if [[ -z $stored_last_seen ]]; then
+		false; until [[ $? = 0 ]]; do
+			$sql "INSERT OR REPLACE INTO hosts (ip,mac,hostname,vendor,os,first_seen,last_seen)
+			VALUES ('$ip','$mac','$hostname','$vendor','$os','$timestamp','$timestamp');" 2>/dev/null
+		done
+
+		# Envia as informações para as APIs
+		api_request update host ip="$ip" hostname="$hostname" mac="$mac" vendor="$vendor" os="$os" lastseen="$timestamp"
+
+		log "INFO: Adding new host ip="$ip" hostname="$hostname" mac="$mac" vendor="$vendor" os="$os""
+
+	else
+		#api_request update host ip="$ip" hostname="$hostname" mac="$mac" vendor="$vendor" os="$os"
+		if [[ -z $stored_hostname ]] && [[ -n $hostname ]]; then
+			false; until [[ $? = 0 ]]; do
+				$sql "UPDATE hosts SET hostname='$hostname' WHERE ip='$ip';" 2>/dev/null
+			done
+				api_request update host ip="$ip" hostname="$hostname"
+				log "INFO: Updating host "$ip" (hostname="$hostname")"
+		fi
+		if [[ -z $stored_mac ]] && [[ -n $mac ]]; then
+			false; until [[ $? = 0 ]]; do
+				$sql "UPDATE hosts SET mac='$mac',vendor='$vendor' WHERE ip='$ip';" 2>/dev/null
+			done
+			api_request update host ip="$ip" mac="$mac" vendor="$vendor"
+			log "INFO: Updating host "$ip" (mac="$mac" vendor="$vendor")"
+		fi
+		if [[ -z $stored_os ]] && [[ -n $os ]]; then
+			false; until [[ $? = 0 ]]; do
+				$sql "UPDATE hosts SET os='$os' WHERE ip='$ip';" 2>/dev/null
+			done
+			api_request update host ip="$ip" os="$os"
+			log "INFO: Updating host "$ip" (os="$os")"
+		fi
+	fi
+}
+
+scan_new_devices(){
+	[[ -n $2 ]] && scanDelay="$2"
+	if [[ "$1" = "devices" ]]; then
+		# Rescan services for all devices first detected more than $scanDelay hours ago
+		log "INFO: Rescanning services of new hosts discovered >${scanDelay} hours ago and <$(( $scanDelay * 2 )) hours ago"
+		while IFS= read -r line; do
+			ip="$line"
+			$0 scan ports $ip &
+		done < <($sql "SELECT ip
+						FROM hosts
+						WHERE first_seen < unixepoch('now','-$scanDelay hours') AND first_seen > unixepoch('now','-$(( $scanDelay * 2 )) hours');")
+	else
+		# Get all services first detected more than $scanDelay hours ago and that have never been scanned
+		# Note: No automatic checks will be run if *any* vulnerability checks have already been run on the host - for example, if a check was run manually before the first automatic check. 
+		vuln="$1"
+		log "INFO: Scanning vulnerabilities for unscanned services discovered more than ${scanDelay} hours ago"
+		while IFS= read -r line; do
+			ip="$(echo $line | cut -f1 -d'|')"
+			service="$(echo $line | cut -f2 -d'|')"
+			port="$(echo $line | cut -f3 -d'|')"
+			#scan_users_default $ip $service $port
+			$0 scan users default $ip $service $port
+		done < <($sqlm "SELECT ip,services.service,services.port
+						FROM services
+						LEFT JOIN vulns USING(ip)
+						WHERE services.first_seen < unixepoch('now','-$scanDelay hours') AND vulns.${vuln}_t IS NULL;")
+	fi
+}
+
+clean(){
+	[[ -n $3 ]] && expireDelay="$3"
+	if [[ $2 = hosts ]]; then
+		# Remove hosts last seen more than $expireDelay (default: 30) days ago
+		log "INFO: Removing hosts last seen more than $expireDelay days ago"
+		while IFS= read -r line; do
+			ip="$line"
+			api_request delete host ip="$ip"
+			# Best done with FOREIGN KEY and ON DELETE CASCADE
+			$sql "DELETE FROM vulns WHERE ip='$ip'; DELETE FROM services WHERE ip='$ip'; DELETE FROM hosts WHERE ip='$ip';"
+		done < <($sql "SELECT ip
+						FROM hosts
+						WHERE last_seen < unixepoch('now','-$expireDelay days');")
+	elif [[ $2 = services ]]; then
+		# Remove services last seen more than $expireDelay (default: 30) days ago
+		log "INFO: Removing services last seen more than $expireDelay days ago"
+		while IFS= read -r line; do
+			ip="$(echo $line | cut -f1 -d'|')"
+			port="$(echo $line | cut -f2 -d'|')"
+			api_request delete service ip="$ip"
+			$sql "DELETE FROM vulns WHERE ip='$ip' AND port='$port'; DELETE FROM services WHERE ip='$ip' AND port='$port';"
+		done < <($sqlm "SELECT ip,port
+						FROM services
+						WHERE last_seen < unixepoch('now','-$expireDelay days');")
+	fi
+}
+
+sync_inventory(){
+	if [[ -n $ip ]]; then
+		log "INFO: Re-synchronizing $ip inventory..."
+		while IFS= read -r line; do
+			port="$(echo $line | cut -f1 -d'|')"
+			service="$(echo $line | cut -f2 -d'|')"
+			product="$(echo $line | cut -f3 -d'|')"
+			version="$(echo $line | cut -f4 -d'|')"
+
+			api_request update item ip="$ip" service="$service" port="$port"
+			[[ -n $product ]] && api_request update item ip="$ip" service="$service" port="$port" item="product" value="$product"
+			[[ -n $version ]] && api_request update item ip="$ip" service="$service" port="$port" item="version" value="$version"
+			#unset ip port service product version
+		done < <($sqlm "SELECT port,service,product,version FROM services WHERE ip='$ip';")
+	else
+		log "INFO: Re-synchronizing complete inventory..."
+		while IFS= read -r line; do
+			ip="$(echo $line | cut -f1 -d'|')"
+			port="$(echo $line | cut -f2 -d'|')"
+			service="$(echo $line | cut -f3 -d'|')"
+			product="$(echo $line | cut -f4 -d'|')"
+			version="$(echo $line | cut -f5 -d'|')"
+
+			api_request update item ip="$ip" service="$service" port="$port"
+			[[ -n $product ]] && api_request update item ip="$ip" service="$service" port="$port" item="product" value="$product"
+			[[ -n $version ]] && api_request update item ip="$ip" service="$service" port="$port" item="version" value="$version"
+			#unset ip port service product version
+		done < <($sqlm "SELECT ip,port,service,product,version FROM services;")
+	fi
+}
+
+get_host_services(){
+	ip="$1"
+	$sqlm "SELECT service,port FROM services WHERE ip='${ip}';"
+}
+
+# Queuing function using a sleep lock to keep the process queue at $maxQueue (default 1).
+# Currently using LIFO to prioritise child-processes.
+# Note: If the server is overloaded by other processes, the lock will never be released.
+checkQueue(){
+	# Clean dead PIDs from the queue
+	for pid in $(ls $lockDir); do
+		if ! ps ${pid:-1} >/dev/null 2>&1; then rm $lockDir/$pid 2>/dev/null; fi
+	done
+
+	# Add PID to the queue
+	touch "$lockFile" || exit 1										# Add PID to the queue or die to prevent runaways
+	cpus=$(grep -cw ^processor /proc/cpuinfo)						# Count CPUs
+	load=$(cut -f1 -d'.' /proc/loadavg)								# Calculate load (rounded)
+	memFree=$(grep MemAvailable /proc/meminfo | awk '{print $2}')	# Calculate available memory
+
+	while true; do
+		until (( $load/$cpus < $maxQueue )) && (( $memFree > $memReserve )); do
+			sleep 2
+			load=$(cut -f1 -d'.' /proc/loadavg)
+			memFree=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
+		done
+
+		minPID=$(ls $lockDir | sort -n | tail -n1)
+		if [[ $$ = ${minPID:-$$} ]]; then
+			rm $lockFile
+			return 0
+		else
+			# Add an extra wait to allow the new process to spin up
+			sleep 5
+		fi
+	done
+}
+
+
+#######################################
+#           Global Functions          #
+#######################################
+
+logPrefix="NetWarden"
+log(){
+	echo "[$(date '+%x %X')] $logPrefix $*" >> $logfile
+}
+export -f log
+
+#######################################
+#              Execution              #
+#######################################
+
+checkQueue
+case $1 in
+	discover)
+		case $2 in
+			devices)
+				target="$3"
+				if [[ -f "$target" ]]; then
+					log "INFO: Discovering devices fom file $target"
+					discover_devices "$target"
+				#elif isValidSubnet "$target" || isValidIP "$target"; then
+				else
+					log "INFO: Discovering devices for $target"
+					tmpfile=$(mktemp -p "${tmpdir}")
+					sudo nmap -sn -T4 -oX "$tmpfile" $target >/dev/null || exit 1
+					discover_devices "$tmpfile"
+				fi
+			;;
+		esac
+	;;
+	scan)
+		case $2 in
+			ports)
+				# <ip/net> <port>
+				scan_ports "$3" "$4"
+			;;
+			users)
+				case $3 in
+					default)
+						#<ip> <service> <port> [list]
+						ip="$4"; service="$5"; port="$6"; passwordFile="$7"
+						scan_users_default "$ip" "$service" "$port" "$passwordFile"
+					;;
+				esac
+			;;
+			vulns)
+				#OpenVAS
+			;;
+			new)
+				vuln="$3"; hours="$4"
+				scan_new_devices $vuln $hours
+			;;
+		esac
+	;;
+	get)
+		case $2 in
+			host)
+				case $3 in
+					services)
+						ip="$4"
+						get_host_services "$ip"
+					;;
+				esac
+			;;
+		esac
+	;;
+	clean)
+		#clean <hosts|services|all> [days]
+		case $2 in
+			hosts)
+				clean hosts
+			;;
+			services)
+				clean services
+			;;
+			all)
+				clean hosts
+				clean services
+			;;
+		esac
+	;;
+	sync)
+		case $2 in
+			[0-9]*)
+				ip="$2"
+				sync_inventory $ip
+			;;
+			*)
+				sync_inventory
+			;;
+		esac
+	;;
+	help|*)
+		print_help
+	;;
+esac
